@@ -1,0 +1,9 @@
+# 统一换行符，避免 Windows 检出时把 .py 变成 CRLF
+* text=auto eol=lf
+
+# 二进制文件不做转换
+*.pt binary
+*.gz binary
+*.zip binary
+*.png binary
+*.jpg binary
