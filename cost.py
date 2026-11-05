@@ -45,31 +45,34 @@ def sync():
 
 
 @torch.no_grad()
-@torch.no_grad()
 def official_bench(model, files, tf, repeat=3, warmup=3):
-    """官方口径: batch=1, 连续 100 张, 重复 3 次取中位数, 端到端(预处理+前向)"""
+    """官方口径: batch=1, 连续 N 张, 每张图重复 repeat 次取中位数, 再对全部图求平均。
+
+    返回 (每张图的中位数 ms 数组, 每次重复的平均 ms 数组)
+    """
     age = torch.zeros(1, 1, device=DEVICE)
-    # 预热
-    for p in files[:warmup]:
+    for p in files[:warmup]:                      # 预热
         img = read_image(p)
         x = tf(image=img)["image"].unsqueeze(0).to(DEVICE)
         with amp_ctx():
             model(x, age)
     sync()
 
-    per_run = []
-    for r in range(repeat):
-        t0 = time.perf_counter()
+    per_run = []                                  # 每次重复: 每张图的 ms
+    for _ in range(repeat):
+        times = []
         for p in files:
-            img = read_image(p)                       # 读图
+            t0 = time.perf_counter()
+            img = read_image(p)                       # 读图(含 JPEG 解码)
             x = tf(image=img)["image"].unsqueeze(0)   # 预处理
             x = x.to(DEVICE)
             with amp_ctx():
                 model(x, age)                         # 前向
-        sync()
-        dt = time.perf_counter() - t0
-        per_run.append(dt / len(files) * 1000)        # ms/张
-    return per_run
+            sync()
+            times.append((time.perf_counter() - t0) * 1000.0)
+        per_run.append(times)
+    arr = np.asarray(per_run)                     # (repeat, n_images)
+    return np.median(arr, axis=0), arr.sum(axis=1) / arr.shape[1]
 
 
 def bench_forward(model, size, batch, n_iter, tta):
@@ -130,14 +133,19 @@ def main():
         tf = build_transforms(sizes[0], False)
         print(f"[*] 官方口径: batch=1, {len(files)} 张, 重复 {args.repeat} 次, "
               f"尺寸 {sizes[0]}")
-        runs = official_bench(model, files, tf, repeat=args.repeat)
-        import statistics
-        med = statistics.median(runs)
-        print("\n  各次结果(ms/张): " + "  ".join(f"{x:.2f}" for x in runs))
-        print(f"  中位数 = {med:.2f} ms/张 (端到端, 含读图与预处理)")
-        print(f"  按 {args.total} 张估算: {med * args.total / 1000:.1f} s "
-              f"({med * args.total / 60000:.1f} min)")
-        print("\n[填写到清单 F1] " + f"{med:.2f} ms/张")
+        med_per_img, run_means = official_bench(model, files, tf,
+                                               repeat=args.repeat)
+        mean = float(np.mean(med_per_img))
+        p50 = float(np.percentile(med_per_img, 50))
+        p90 = float(np.percentile(med_per_img, 90))
+        print("\n  每次重复的平均(ms/张): "
+              + "  ".join(f"{x:.2f}" for x in run_means))
+        print(f"  每张图取中位数后的统计: 平均={mean:.2f}  中位={p50:.2f}  "
+              f"P90={p90:.2f} ms/张")
+        print(f"  （端到端：读图+预处理+前向，batch=1，{len(files)} 张）")
+        print(f"  按 {args.total} 张估算: {mean * args.total / 1000:.1f} s "
+              f"({mean * args.total / 60000:.1f} min)")
+        print("\n[填写到清单 F1] " + f"{mean:.2f} ms/张")
         return
 
     # --- 预处理耗时 ---
