@@ -45,6 +45,33 @@ def sync():
 
 
 @torch.no_grad()
+@torch.no_grad()
+def official_bench(model, files, tf, repeat=3, warmup=3):
+    """官方口径: batch=1, 连续 100 张, 重复 3 次取中位数, 端到端(预处理+前向)"""
+    age = torch.zeros(1, 1, device=DEVICE)
+    # 预热
+    for p in files[:warmup]:
+        img = read_image(p)
+        x = tf(image=img)["image"].unsqueeze(0).to(DEVICE)
+        with amp_ctx():
+            model(x, age)
+    sync()
+
+    per_run = []
+    for r in range(repeat):
+        t0 = time.perf_counter()
+        for p in files:
+            img = read_image(p)                       # 读图
+            x = tf(image=img)["image"].unsqueeze(0)   # 预处理
+            x = x.to(DEVICE)
+            with amp_ctx():
+                model(x, age)                         # 前向
+        sync()
+        dt = time.perf_counter() - t0
+        per_run.append(dt / len(files) * 1000)        # ms/张
+    return per_run
+
+
 def bench_forward(model, size, batch, n_iter, tta):
     x = torch.randn(batch, 3, size, size, device=DEVICE)
     age = torch.zeros(batch, 1, device=DEVICE)
@@ -78,6 +105,10 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--total", type=int, default=5855, help="用于估算总耗时")
+    ap.add_argument("--official", action="store_true",
+                    help="官方口径: batch=1, 连续100张, 重复3次取中位数, 含预处理")
+    ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--n_images", type=int, default=100, help="官方口径使用的图片数")
     args = ap.parse_args()
 
     model, a, ckpt, t_load = load(args.ckpt)
@@ -85,6 +116,29 @@ def main():
              else [a["img_size"]])
     print(f"[*] device={DEVICE}  backbone={a['backbone']}  "
           f"train_size={a['img_size']}  ckpt加载={t_load:.2f}s")
+
+    if args.official:
+        files = [p for p in Path(args.img_dir).iterdir()
+                 if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png",
+                                                         ".JPG", ".JPEG", ".PNG")]
+        files = sorted(files)[:args.n_images]
+        if len(files) < args.n_images:
+            print(f"[!] 只找到 {len(files)} 张图, 少于要求的 {args.n_images} 张")
+        if not files:
+            print("[!] img_dir 下没有图片, 无法按官方口径测试")
+            return
+        tf = build_transforms(sizes[0], False)
+        print(f"[*] 官方口径: batch=1, {len(files)} 张, 重复 {args.repeat} 次, "
+              f"尺寸 {sizes[0]}")
+        runs = official_bench(model, files, tf, repeat=args.repeat)
+        import statistics
+        med = statistics.median(runs)
+        print("\n  各次结果(ms/张): " + "  ".join(f"{x:.2f}" for x in runs))
+        print(f"  中位数 = {med:.2f} ms/张 (端到端, 含读图与预处理)")
+        print(f"  按 {args.total} 张估算: {med * args.total / 1000:.1f} s "
+              f"({med * args.total / 60000:.1f} min)")
+        print("\n[填写到清单 F1] " + f"{med:.2f} ms/张")
+        return
 
     # --- 预处理耗时 ---
     files = [p for p in Path(args.img_dir).iterdir()

@@ -97,11 +97,14 @@ python code/predict.py \
 python -c "import hashlib,pandas as pd; d=pd.read_csv('submission.csv'); n=d.Image_name.astype(str); q=d.Probability.astype(float); print(len(d), round(q.mean(),6), hashlib.sha256(chr(10).join('%s,%.6f'%(a,b) for a,b in zip(n,q)).encode()).hexdigest()[:32])"
 ```
 
-耗时测试：
+耗时测试（官方口径：batch=1、连续 100 张、重复 3 次取中位数、含预处理）：
 
 ```bash
-python cost.py --ckpt model/pretrain_model/runs_b3_s42/best.pt --img_dir data/test
+python cost.py --ckpt model/pretrain_model/runs_b3_s42/best.pt \
+  --img_dir data/test --official --n_images 100 --repeat 3
 ```
+
+输出会直接给出可填入核验清单 F1 的 `ms/张`。
 
 ---
 
