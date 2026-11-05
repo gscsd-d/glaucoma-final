@@ -144,4 +144,4 @@ python cost.py --ckpt model/pretrain_model/runs_b3_s42/best.pt --img_dir data/te
 
 ## 9. 联系
 
-【队伍名称 / 队长 / 联系方式】
+张孝昊 19527826519
