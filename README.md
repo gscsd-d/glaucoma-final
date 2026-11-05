@@ -144,4 +144,4 @@ python cost.py --ckpt model/pretrain_model/runs_b3_s42/best.pt --img_dir data/te
 
 ## 9. 联系
 
-张孝昊 19527826519
+张孝昊 3462215861@qq.com
