@@ -1,0 +1,13 @@
+# 权重与打包产物不入库（走 Release 附件）
+model/
+*.zip
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时文件
+_smoke_*.csv
+_audit.py
