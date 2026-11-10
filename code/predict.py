@@ -35,7 +35,44 @@ from tqdm import tqdm
 
 from model import GlaucomaModel
 from utils import (RetinaDataset, build_transforms, resolve_columns,
-                   amp_ctx, DEVICE)
+                   read_image, amp_ctx, DEVICE)
+
+
+def load_models(ckpts, weights=None):
+    """加载并返回 (models, weights), 统一供 cost.py 复用"""
+    models = [load_model(c) for c in ckpts]
+    w = weights if weights else [1.0] * len(models)
+    assert len(w) == len(models), "weights 数量必须等于 ckpts 数量"
+    return models, w
+
+
+@torch.no_grad()
+def infer_one(models, weights, sizes, tta, img_path, age_value=None):
+    """单张图片端到端推理(供 cost.py 调用), 返回 sigmoid 概率。
+
+    与批量推理共用 read_image / build_transforms / predict_tta, 保证口径一致。
+    """
+    img = read_image(img_path)                     # 读图(含 JPEG 解码)
+    probs = []
+    for m, szs in zip(models, sizes):
+        a = m["args"]
+        ag = torch.tensor([[0.0]], dtype=torch.float32)
+        if age_value is not None and m["use_age"]:
+            v = float(age_value)
+            if 1.0 <= v <= 110.0:
+                ag = torch.tensor([[(v - m["age_mean"]) / m["age_std"]]],
+                                  dtype=torch.float32)
+        ag = ag.to(DEVICE)
+        per = []
+        for sz in (szs or [a["img_size"]]):
+            tf = build_transforms(sz, False)
+            x = tf(image=img)["image"].unsqueeze(0).to(DEVICE)
+            with amp_ctx():
+                p = predict_tta(m["model"], x, ag, tta=tta)
+            per.append(float(p.item()))
+        probs.append(float(np.mean(per)))
+    w = np.asarray(weights, dtype=float)
+    return float((np.asarray(probs) * w).sum() / w.sum())
 
 
 def load_model(ckpt_path):

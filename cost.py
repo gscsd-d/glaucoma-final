@@ -1,192 +1,190 @@
 """
-耗时测试脚本 —— 统计推理各阶段耗时
+推理耗时脚本（严格按《比赛参赛规则》第7条）
 
-输出:
-  1) 模型加载耗时
-  2) 单张推理耗时(含预处理 / 仅前向)
-  3) 批推理吞吐(images/s)
-  4) 开启 TTA、多尺度后的耗时倍率
-  5) 按测试集规模估算总耗时
+用法（官方规定接口）:
+    python cost.py <submission.csv> <pictures_100> <pictures_5> \
+        [--ckpts ckpt1 ckpt2 ckpt3] [--weights 1 1 0.6] \
+        [--sizes "512,576,640"] [--no_tta] [--test_csv test.csv]
 
-用法:
-  python cost.py --ckpt ../model/pretrain_model/b3_s42.pt --img_dir data/test --n 50
+口径:
+  · batch=1 串行, 单张端到端(读图→预处理→前向→输出预测), 含预处理
+  · 5 张预热图不计入; 模型加载/初始化不计入
+  · 连续 3 轮: 先对每张取 3 轮均值, 再对 100 张取平均
+  · 与 submission.csv 逐张比对: 二值判定须完全一致, |Δp|<=1e-3 视为正常波动
 """
 import argparse
-import sys
+import statistics
 import time
 from pathlib import Path
 
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+import pandas as pd
 
-# cost.py 位于提交包根目录, 代码在 ./code 下
-sys.path.insert(0, str(Path(__file__).resolve().parent / "code"))
+# 保证无论从哪个目录执行，都能找到同包内的 code/ 模块
+import sys
+_HERE = Path(__file__).resolve().parent
+for _p in (str(_HERE), str(_HERE / "code")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from model import GlaucomaModel
-from utils import RetinaDataset, build_transforms, read_image, amp_ctx, DEVICE
+import predict as P
+from utils import DEVICE
 
-
-def load(ckpt_path):
-    t0 = time.perf_counter()
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    a = ckpt["args"]
-    m = GlaucomaModel(a["backbone"], False, a["use_age"]).to(DEVICE)
-    m.load_state_dict(ckpt["model"])
-    m.eval()
-    if str(DEVICE).startswith("cuda"):
-        torch.cuda.synchronize()
-    return m, a, ckpt, (time.perf_counter() - t0)
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 
-def sync():
-    if str(DEVICE).startswith("cuda"):
-        torch.cuda.synchronize()
+def parse_sizes(spec, n):
+    per = [[int(x) for x in g.replace(" ", "").split(",") if x]
+           for g in spec.split(";") if g.strip()]
+    if len(per) == 1:
+        return per * n
+    assert len(per) == n, "--sizes 分组数与模型数不一致"
+    return per
 
 
-@torch.no_grad()
-def official_bench(model, files, tf, repeat=3, warmup=3):
-    """官方口径: batch=1, 连续 N 张, 每张图重复 repeat 次取中位数, 再对全部图求平均。
-
-    返回 (每张图的中位数 ms 数组, 每次重复的平均 ms 数组)
-    """
-    age = torch.zeros(1, 1, device=DEVICE)
-    for p in files[:warmup]:                      # 预热
-        img = read_image(p)
-        x = tf(image=img)["image"].unsqueeze(0).to(DEVICE)
-        with amp_ctx():
-            model(x, age)
-    sync()
-
-    per_run = []                                  # 每次重复: 每张图的 ms
-    for _ in range(repeat):
-        times = []
-        for p in files:
-            t0 = time.perf_counter()
-            img = read_image(p)                       # 读图(含 JPEG 解码)
-            x = tf(image=img)["image"].unsqueeze(0)   # 预处理
-            x = x.to(DEVICE)
-            with amp_ctx():
-                model(x, age)                         # 前向
-            sync()
-            times.append((time.perf_counter() - t0) * 1000.0)
-        per_run.append(times)
-    arr = np.asarray(per_run)                     # (repeat, n_images)
-    return np.median(arr, axis=0), arr.sum(axis=1) / arr.shape[1]
+def list_imgs(d):
+    return sorted([p for p in Path(d).iterdir()
+                   if p.is_file() and p.suffix.lower() in IMG_EXT])
 
 
-def bench_forward(model, size, batch, n_iter, tta):
-    x = torch.randn(batch, 3, size, size, device=DEVICE)
-    age = torch.zeros(batch, 1, device=DEVICE)
-    # 预热
-    for _ in range(3):
-        with amp_ctx():
-            _ = model(x, age)
-    sync()
-    t0 = time.perf_counter()
-    for _ in range(n_iter):
-        with amp_ctx():
-            if tta:
-                model(x, age)
-                model(torch.flip(x, dims=[3]), age)
-                model(torch.flip(x, dims=[2]), age)
-                model(torch.flip(x, dims=[2, 3]), age)
-            else:
-                model(x, age)
-    sync()
-    dt = time.perf_counter() - t0
-    per_img = dt / (n_iter * batch)
-    return per_img, (batch / per_img if per_img > 0 else float("inf"))
+def find_age_csv(cli, d100, sub_csv=None):
+    """年龄文件多路径查找: 官方只传 3 个参数, 必须能自动定位"""
+    if cli and Path(cli).exists():
+        return Path(cli)
+    here = Path(__file__).resolve().parent
+    cands = [
+        Path(d100) / "test.csv",
+        Path(d100).parent / "test.csv",
+        Path(d100).parent / "data" / "test.csv",
+        Path(sub_csv).parent / "test.csv" if sub_csv else None,
+        here / "data" / "test.csv",
+        here / ".." / "data" / "test.csv",
+        here.parent / "autodl-tmp" / "data" / "test.csv",
+    ]
+    for c in cands:
+        if c and Path(c).exists():
+            return Path(c)
+    return None
+
+
+def derive_threshold(sub):
+    """由 submission 的 Pred_Label 反推阈值（可分离时取中点）"""
+    p0 = sub[sub.Pred_Label == 0].Probability
+    p1 = sub[sub.Pred_Label == 1].Probability
+    if len(p0) and len(p1):
+        return float((p0.max() + p1.min()) / 2)
+    return 0.5
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--img_dir", default="data/test")
-    ap.add_argument("--sizes", default=None, help="如 512,576,640; 不传用 ckpt 的 img_size")
-    ap.add_argument("--n", type=int, default=50, help="预处理测速用的图片数")
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--total", type=int, default=5855, help="用于估算总耗时")
-    ap.add_argument("--official", action="store_true",
-                    help="官方口径: batch=1, 连续100张, 重复3次取中位数, 含预处理")
-    ap.add_argument("--repeat", type=int, default=3)
-    ap.add_argument("--n_images", type=int, default=100, help="官方口径使用的图片数")
+    ap.add_argument("submission_csv")
+    ap.add_argument("pictures_100")
+    ap.add_argument("pictures_5")
+    ap.add_argument("--ckpts", nargs="+", default=None)
+    ap.add_argument("--weights", nargs="*", type=float, default=None)
+    ap.add_argument("--sizes", default="",
+                    help="默认空=各模型用自身训练尺度（与提交链路一致）")
+    ap.add_argument("--tta", action="store_true",
+                    help="启用翻转TTA；默认关闭，与提交链路一致")
+    ap.add_argument("--test_csv", default=None, help="提供 age 的标注文件")
+    ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--limit", type=int, default=0, help="调试用: 只跑前 N 张")
     args = ap.parse_args()
 
-    model, a, ckpt, t_load = load(args.ckpt)
-    sizes = ([int(x) for x in args.sizes.split(",")] if args.sizes
-             else [a["img_size"]])
-    print(f"[*] device={DEVICE}  backbone={a['backbone']}  "
-          f"train_size={a['img_size']}  ckpt加载={t_load:.2f}s")
+    root = Path(__file__).resolve().parent
+    ckpts = args.ckpts or [
+        str(root / "model" / "pretrain_model" / n / "best.pt")
+        for n in ("runs_b3_s42", "runs_b3_s123", "runs_b4")]
+    weights = args.weights or [1.0, 1.0, 0.6]
+    tta = bool(args.tta)
 
-    if args.official:
-        files = [p for p in Path(args.img_dir).iterdir()
-                 if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png",
-                                                         ".JPG", ".JPEG", ".PNG")]
-        files = sorted(files)[:args.n_images]
-        if len(files) < args.n_images:
-            print(f"[!] 只找到 {len(files)} 张图, 少于要求的 {args.n_images} 张")
-        if not files:
-            print("[!] img_dir 下没有图片, 无法按官方口径测试")
-            return
-        tf = build_transforms(sizes[0], False)
-        print(f"[*] 官方口径: batch=1, {len(files)} 张, 重复 {args.repeat} 次, "
-              f"尺寸 {sizes[0]}")
-        med_per_img, run_means = official_bench(model, files, tf,
-                                               repeat=args.repeat)
-        mean = float(np.mean(med_per_img))
-        p50 = float(np.percentile(med_per_img, 50))
-        p90 = float(np.percentile(med_per_img, 90))
-        print("\n  每次重复的平均(ms/张): "
-              + "  ".join(f"{x:.2f}" for x in run_means))
-        print(f"  每张图取中位数后的统计: 平均={mean:.2f}  中位={p50:.2f}  "
-              f"P90={p90:.2f} ms/张")
-        print(f"  （端到端：读图+预处理+前向，batch=1，{len(files)} 张）")
-        print(f"  按 {args.total} 张估算: {mean * args.total / 1000:.1f} s "
-              f"({mean * args.total / 60000:.1f} min)")
-        print("\n[填写到清单 F1] " + f"{mean:.2f} ms/张")
-        return
+    # ---- 模型加载（不计时）----
+    t0 = time.perf_counter()
+    models, w = P.load_models(ckpts, weights)
+    sizes = parse_sizes(args.sizes, len(models))
+    load_s = time.perf_counter() - t0
 
-    # --- 预处理耗时 ---
-    files = [p for p in Path(args.img_dir).iterdir()
-             if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")][:args.n]
-    if files:
-        tf = build_transforms(sizes[0], False)
-        t0 = time.perf_counter()
-        for p in files:
-            im = read_image(p)
-            tf(image=im)
-        pre = (time.perf_counter() - t0) / len(files)
-        print(f"[*] 预处理(读图+变换) 单张 = {pre * 1000:.1f} ms  (n={len(files)})")
-    else:
-        pre = 0.0
-        print("[!] 未找到图片, 跳过预处理测速")
+    imgs100 = list_imgs(args.pictures_100)
+    imgs5 = list_imgs(args.pictures_5)
+    if args.limit:
+        imgs100 = imgs100[:args.limit]
 
-    # --- 前向耗时 ---
-    print(f"\n{'batch':>6} {'size':>6} {'TTA':>5} {'单张前向':>12} {'吞吐(张/秒)':>14}")
-    print("-" * 50)
-    results = []
-    for sz in sizes:
-        for b in (1, args.batch):
-            for tta in (False, True):
-                n_iter = max(2, 20 // b)
-                per_img, ips = bench_forward(model, sz, b, n_iter, tta)
-                print(f"{b:>6} {sz:>6} {str(tta):>5} {per_img * 1000:>10.1f}ms {ips:>14.1f}")
-                results.append((sz, b, tta, per_img, ips))
+    print(f"[INFO] 模型 {len(models)} 个, 权重 {w}")
+    print(f"[INFO] 推理配置: sizes={sizes} TTA={tta} batch=1")
+    print(f"[INFO] 预热图 {len(imgs5)} 张, 计时图 {len(imgs100)} 张, 轮数 {args.rounds}")
+    print(f"[INFO] 模型加载耗时 {load_s*1000:.0f} ms（不计入）")
+    print(f"[INFO] device={DEVICE}")
 
-    # --- 总耗时估算 ---
-    n_scale = len(sizes)
-    best = max(results, key=lambda r: r[4])
-    per_img_total = 1.0 / best[4] + pre
-    print(f"\n[*] 最快配置: size={best[0]} batch={best[1]} tta={best[2]}")
-    print(f"[*] 单图总耗时(前向+预处理) ≈ {per_img_total * 1000:.1f} ms")
-    for tta in (False, True):
-        mult = 4 if tta else 1
-        est = per_img_total * n_scale * mult * args.total
-        print(f"[*] 估算 {args.total} 张, {n_scale} 尺度, TTA={tta}: {est:.1f}s "
-              f"({est / 60:.1f} min)")
-    print("\n[提示] 上述为单模型耗时; 3 模型集成需乘以 3。")
+    # ---- age 映射 ----
+    age_map = {}
+    csv = find_age_csv(args.test_csv, args.pictures_100, args.submission_csv)
+    if csv:
+        df = pd.read_csv(csv)
+        cols = {str(c).lower(): c for c in df.columns}
+        ic = cols.get("image_name") or cols.get("image")
+        ac = cols.get("age")
+        if ic and ac:
+            for _, r in df.iterrows():
+                age_map[Path(str(r[ic])).name.lower()] = r[ac]
+            print(f"[INFO] 年龄取自 {csv}（{len(age_map)} 条）")
+    if not age_map:
+        print("[WARN] 未找到年龄文件, age 按均值处理, 可能与 submission 不一致")
+
+    # ---- 预热（不计时）----
+    for p in imgs5:
+        P.infer_one(models, w, sizes, tta, str(p), age_map.get(p.name.lower()))
+
+    # ---- 计时轮 ----
+    per_img = {p.name: [] for p in imgs100}
+    for r in range(args.rounds):
+        t_round = time.perf_counter()
+        for p in imgs100:
+            t0 = time.perf_counter()
+            prob = P.infer_one(models, w, sizes, tta, str(p),
+                               age_map.get(p.name.lower()))
+            float(prob)                          # 输出预测结果
+            per_img[p.name].append((time.perf_counter() - t0) * 1000.0)
+        print(f"  第 {r+1} 轮完成: {time.perf_counter()-t_round:.1f} s")
+
+    img_mean = [float(np.mean(v)) for v in per_img.values()]
+    avg_ms = float(np.mean(img_mean))
+
+    # ---- 与 submission.csv 比对（重跑一次取稳定概率）----
+    sub = pd.read_csv(args.submission_csv)
+    sub.columns = [str(c).strip() for c in sub.columns]
+    name_col = "Image_name" if "Image_name" in sub.columns else sub.columns[0]
+    prob_col = "Probability" if "Probability" in sub.columns else sub.columns[1]
+    th = derive_threshold(sub) if "Pred_Label" in sub.columns else 0.5
+
+    sub_map = {}
+    for _, r in sub.iterrows():
+        sub_map[Path(str(r[name_col])).name.lower()] = float(r[prob_col])
+
+    checked, mism, max_dp = 0, 0, 0.0
+    for p in imgs100:
+        key = p.name.lower()
+        if key not in sub_map:
+            continue
+        prob = P.infer_one(models, w, sizes, tta, str(p),
+                           age_map.get(key))
+        checked += 1
+        dp = abs(prob - float(sub_map[key]))
+        max_dp = max(max_dp, dp)
+        if dp > 1e-3 and ((prob >= th) != (float(sub_map[key]) >= th)):
+            mism += 1
+
+    status = ("未超过上限" if avg_ms <= 100
+              else ("明显超限(100-150ms)" if avg_ms <= 150 else "严重超限(>150ms)"))
+    print("\n" + "=" * 70)
+    print(f"[CONCLUSION] 结论：{len(imgs100)} 张样本、batch=1 串行、连续{args.rounds}轮；"
+          f"单张端到端墙钟时间先按每张{args.rounds}轮取均值，再对{len(imgs100)}张取平均，"
+          f"最终平均耗时 {avg_ms:.0f} ms，{status}；"
+          f"预测结果与 submission.csv 比对 {checked} 张，不一致 {mism} 张；"
+          f"推理精度 {'fp16/bf16' if 'cuda' in str(DEVICE) else 'fp32'}。")
+    print(f"[STATS] 单张均值 {avg_ms:.1f} ms | 中位 {statistics.median(img_mean):.1f} ms "
+          f"| 最大 {max(img_mean):.1f} ms | 最大概率偏差 {max_dp:.6f}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
