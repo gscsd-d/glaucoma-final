@@ -35,7 +35,9 @@ IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 def parse_sizes(spec, n):
     per = [[int(x) for x in g.replace(" ", "").split(",") if x]
-           for g in spec.split(";") if g.strip()]
+           for g in (spec or "").split(";") if g.strip()]
+    if not per:                     # 空 = 各模型用自身训练尺度
+        return [[] for _ in range(n)]
     if len(per) == 1:
         return per * n
     assert len(per) == n, "--sizes 分组数与模型数不一致"
@@ -95,8 +97,8 @@ def main():
     root = Path(__file__).resolve().parent
     ckpts = args.ckpts or [
         str(root / "model" / "pretrain_model" / n / "best.pt")
-        for n in ("runs_b3_s42", "runs_b3_s123", "runs_b4")]
-    weights = args.weights or [1.0, 1.0, 0.6]
+        for n in ("runs_b3_s123",)]
+    weights = args.weights or [1.0]
     tta = bool(args.tta)
 
     # ---- 模型加载（不计时）----
